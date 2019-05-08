@@ -11,12 +11,14 @@ var (
 	contentChannel  = make(chan Content, channelNumber)
 	complete        = make(chan bool, downloaderCount)
 	writerComplete  = make(chan bool, fileWriter)
+	errChan         = make(chan bool)
 	done            = false
-	channelNumber   = 20
+	channelNumber   = 2000
 	fileWriter      = 4
 	downloaderCount = 4
 )
 
+//Content struct is to store the resoponse recieved from the server
 type Content struct {
 	Data     []byte
 	Location int64
@@ -33,27 +35,42 @@ func getRangeEnd(start, end, interval int64) int64 {
 
 //function to download the content and add it to the channel
 func downloader(start, end, interval int64, url string) {
+
 	client := &http.Client{}
 
 	for start < end {
-		req, _ := http.NewRequest("GET", url, nil)
 
+		req, _ := http.NewRequest("GET", url, nil)
 		rangeEnd := getRangeEnd(start, end, interval)
-		log.Printf("range data : %d - %d  (%d)\n", start, rangeEnd, end)
+
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, rangeEnd))
 
-		res, _ := client.Do(req)
+		res, err := client.Do(req)
+		if err != nil {
+			log.Println("error occured while performing request : ", err.Error())
+			errChan <- true
+			return
+		}
 
 		if res.StatusCode != 206 {
 
 			log.Println("Got Response Code : ", res.StatusCode)
+			errChan <- true
+			return
 
 		} else {
-			body, _ := ioutil.ReadAll(res.Body)
+			body, err := ioutil.ReadAll(res.Body)
+			if err != nil {
+				log.Println("following error occured while reading the body : ", err.Error())
+				errChan <- true
+				return
+			}
+
 			contentChannel <- Content{Data: body, Location: start}
 			start = rangeEnd + 1
+			res.Body.Close()
 		}
-
+		req.Close = true
 	}
 
 	complete <- true
@@ -66,13 +83,27 @@ func writerFunc(file *os.File) {
 	var data Content
 
 	for len(complete) != downloaderCount {
+
 		select {
 		case data = <-contentChannel:
-			file.WriteAt(data.Data, data.Location)
+			_, err := file.WriteAt(data.Data, data.Location)
+			if err != nil {
+				log.Println("error while writing data to the file : ", err.Error())
+				errChan <- true
+				return
+			}
+		default:
 		}
+
 	}
 
-	writerComplete <- true
+	select {
+	case writerComplete <- true:
+	default:
+		log.Println("Unable to write to the channel", len(writerComplete), cap(writerComplete))
+	}
+
+	return
 }
 
 func main() {
@@ -111,22 +142,31 @@ func main() {
 	start = 0
 	end = -1
 
-	for i < channelNumber {
+	for i < downloaderCount {
 
 		start = end + 1
 
 		if i == 3 {
 			end = contentLen
 		} else {
-			end = int64((contentLen / int64(channelNumber)) * (int64(i) + 1))
+			end = int64((contentLen / int64(downloaderCount)) * (int64(i) + 1))
 		}
 
-		go downloader(start, end, int64(2000), url) //20 byte is default interval
+		go downloader(start, end, int64(20000), url) //20000 byte is default interval
 		go writerFunc(file)
 
 		i += 1
 	}
-	for len(writerComplete) != fileWriter {
+
+	for len(writerComplete) != fileWriter { //wait for the writer function to complete writing all the data
+
+		select {
+		case <-errChan:
+			log.Println("Writer function encountered an error")
+			return
+		default:
+		}
+
 	}
 
 	log.Println("file writing complete")
